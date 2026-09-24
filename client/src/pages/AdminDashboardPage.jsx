@@ -88,6 +88,30 @@ export default function AdminDashboardPage({ navigateTo }) {
   const [qbSearchQuery, setQbSearchQuery] = useState('');
   const [mockFormError, setMockFormError] = useState('');
   const [mockSaving, setMockSaving] = useState(false);
+  const [autoAssembling, setAutoAssembling] = useState(false);
+  const [activePreparedTab, setActivePreparedTab] = useState('auto'); // 'auto' | 'bank' | 'author'
+  const [mockSubTab, setMockSubTab] = useState('exams'); // 'exams' | 'questions'
+
+  // Question Authoring & Management State
+  const [showAddQuestionModal, setShowAddQuestionModal] = useState(false);
+  const [questionSaving, setQuestionSaving] = useState(false);
+  const [questionFormError, setQuestionFormError] = useState('');
+
+  const defaultQuestionForm = {
+    question: '',
+    question_type: 'MCQ', // 'MCQ' | 'FILL_IN_THE_BLANK'
+    option_a: '',
+    option_b: '',
+    option_c: '',
+    option_d: '',
+    correct_answer: 'A',
+    explanation: '',
+    subject: 'Quantitative Aptitude',
+    topic: 'General Practice',
+    points: 2,
+    attach_to_current_mock: true
+  };
+  const [questionForm, setQuestionForm] = useState(defaultQuestionForm);
 
   const defaultMockForm = {
     title: '',
@@ -237,10 +261,164 @@ export default function AdminDashboardPage({ navigateTo }) {
 
   const handleOpenCreateMockModal = () => {
     setEditingMockExam(null);
-    setMockForm(defaultMockForm);
+    const newTitle = `SSC CGL Tier-1 Grand Full-Length Mock Exam #${mockExamsList.length + 1}`;
+    setMockForm({
+      ...defaultMockForm,
+      title: newTitle,
+      selected_question_ids: []
+    });
     setMockFormError('');
     setShowCreateMockModal(true);
+    setActivePreparedTab('auto');
     fetchQuestionBank('All', '');
+    // Auto-assemble a full 50-question set immediately so it's ready right away
+    handleApplyPreset('ssc');
+  };
+
+  const handleApplyPreset = async (presetName) => {
+    try {
+      setAutoAssembling(true);
+      const res = await fetch('http://localhost:3001/api/admin/mock-exams/generate-set', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-role': 'admin'
+        },
+        body: JSON.stringify({ preset: presetName })
+      });
+      if (res.ok) {
+        const json = await res.json();
+        const ids = json.question_ids || [];
+        setMockForm(prev => ({
+          ...prev,
+          selected_question_ids: ids,
+          subject_distribution: presetName === 'ssc'
+            ? { english: 15, math: 15, reasoning: 10, general_awareness: 10 }
+            : presetName === 'railway'
+              ? { english: 10, math: 15, reasoning: 15, general_awareness: 10 }
+              : presetName === 'banking'
+                ? { english: 20, math: 15, reasoning: 15, general_awareness: 0 }
+                : { english: 12, math: 13, reasoning: 13, general_awareness: 12 }
+        }));
+      }
+    } catch (err) {
+      console.error('Error auto-assembling set:', err);
+    } finally {
+      setAutoAssembling(false);
+    }
+  };
+
+  const handleOpenAddQuestionModal = (defaultSubject = 'Quantitative Aptitude') => {
+    setQuestionForm({
+      ...defaultQuestionForm,
+      subject: defaultSubject,
+      attach_to_current_mock: showCreateMockModal || !!editingMockExam
+    });
+    setQuestionFormError('');
+    setShowAddQuestionModal(true);
+  };
+
+  const handleSaveNewQuestion = async (e) => {
+    e.preventDefault();
+    setQuestionFormError('');
+
+    if (!questionForm.question.trim()) {
+      setQuestionFormError('Question prompt is required.');
+      return;
+    }
+
+    let finalOptions = [];
+    let finalAnswer = questionForm.correct_answer;
+
+    if (questionForm.question_type === 'MCQ') {
+      if (!questionForm.option_a.trim() || !questionForm.option_b.trim()) {
+        setQuestionFormError('At least Option A and Option B are required for MCQ questions.');
+        return;
+      }
+      finalOptions = [
+        questionForm.option_a.trim(),
+        questionForm.option_b.trim(),
+        questionForm.option_c.trim(),
+        questionForm.option_d.trim()
+      ].filter(Boolean);
+
+      const map = {
+        'A': questionForm.option_a.trim(),
+        'B': questionForm.option_b.trim(),
+        'C': questionForm.option_c.trim(),
+        'D': questionForm.option_d.trim()
+      };
+      finalAnswer = map[questionForm.correct_answer] || questionForm.correct_answer;
+    } else {
+      if (!questionForm.correct_answer.trim()) {
+        setQuestionFormError('Correct answer is required.');
+        return;
+      }
+      finalAnswer = questionForm.correct_answer.trim();
+    }
+
+    try {
+      setQuestionSaving(true);
+      const payload = {
+        question: questionForm.question.trim(),
+        question_type: questionForm.question_type,
+        options: finalOptions,
+        correct_answer: finalAnswer,
+        explanation: questionForm.explanation.trim(),
+        subject: questionForm.subject,
+        topic: questionForm.topic.trim(),
+        points: parseInt(questionForm.points, 10) || 2,
+        mock_exam_id: (editingMockExam && questionForm.attach_to_current_mock) ? editingMockExam.id : undefined
+      };
+
+      const res = await fetch('http://localhost:3001/api/admin/mock-exams/questions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-role': 'admin'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      const resData = await res.json();
+      if (!res.ok) {
+        throw new Error(resData.error || 'Failed to save question');
+      }
+
+      const createdQ = resData.data;
+
+      // Immediately add this new question to current mock exam selection!
+      if (showCreateMockModal || questionForm.attach_to_current_mock) {
+        setMockForm(prev => ({
+          ...prev,
+          selected_question_ids: Array.from(new Set([createdQ.id, ...prev.selected_question_ids]))
+        }));
+      }
+
+      setShowAddQuestionModal(false);
+      setQuestionForm(defaultQuestionForm);
+      fetchQuestionBank(qbSubjectFilter, qbSearchQuery);
+      if (editingMockExam) fetchAdminMockExams();
+    } catch (err) {
+      setQuestionFormError(err.message || 'Error saving question');
+    } finally {
+      setQuestionSaving(false);
+    }
+  };
+
+  const handleDeleteQuestion = async (qid, qText) => {
+    if (!window.confirm(`Delete this question from question bank?\n"${(qText || '').substring(0, 60)}..."`)) return;
+    try {
+      const res = await fetch(`http://localhost:3001/api/admin/mock-exams/questions/${qid}`, {
+        method: 'DELETE',
+        headers: { 'x-user-role': 'admin' }
+      });
+      if (res.ok) {
+        fetchQuestionBank(qbSubjectFilter, qbSearchQuery);
+      }
+    } catch (err) {
+      console.error('Error deleting question:', err);
+    }
   };
 
   const handleOpenEditMockModal = (exam) => {
@@ -261,6 +439,7 @@ export default function AdminDashboardPage({ navigateTo }) {
     });
     setMockFormError('');
     setShowCreateMockModal(true);
+    setActivePreparedTab('bank');
     fetchQuestionBank('All', '');
   };
 
@@ -273,22 +452,12 @@ export default function AdminDashboardPage({ navigateTo }) {
       return;
     }
 
-    // Validate minimum 50 questions
-    if (mockForm.creation_mode === 'manual' && mockForm.selected_question_ids.length < 50) {
-      setMockFormError(`A minimum of 50 questions is required for a complete competitive mock exam. Currently selected: ${mockForm.selected_question_ids.length} / 50 questions.`);
-      return;
-    }
+    const selectedIds = mockForm.selected_question_ids || [];
 
-    if (mockForm.creation_mode === 'auto') {
-      const dist = mockForm.subject_distribution;
-      const totalPlanned = (parseInt(dist.english, 10) || 0) + 
-                           (parseInt(dist.math, 10) || 0) + 
-                           (parseInt(dist.reasoning, 10) || 0) + 
-                           (parseInt(dist.general_awareness, 10) || 0);
-      if (totalPlanned < 50) {
-        setMockFormError(`Minimum 50 questions required. Current subject sum is ${totalPlanned} questions. Please adjust counts to reach at least 50.`);
-        return;
-      }
+    // Strictly validate minimum 50 questions
+    if (selectedIds.length < 50) {
+      setMockFormError(`A minimum of 50 questions is required for a complete competitive mock exam. Currently selected: ${selectedIds.length} / 50 questions. Please add ${50 - selectedIds.length} more questions or click one of the 1-Click Presets.`);
+      return;
     }
 
     try {
@@ -303,9 +472,7 @@ export default function AdminDashboardPage({ navigateTo }) {
         negative_marking: parseFloat(mockForm.negative_marking) || 0.25,
         instructions: mockForm.instructions,
         status: mockForm.status,
-        auto_generate: mockForm.creation_mode === 'auto',
-        subject_distribution: mockForm.subject_distribution,
-        question_ids: mockForm.creation_mode === 'manual' ? mockForm.selected_question_ids : undefined
+        question_ids: selectedIds
       };
 
       const url = editingMockExam
@@ -985,13 +1152,24 @@ export default function AdminDashboardPage({ navigateTo }) {
           </div>
           <div style={{ display: 'flex', gap: '10px' }}>
             {activeTab === 'mock-exams' && (
-              <button 
-                className="btn btn-primary"
-                onClick={handleOpenCreateMockModal}
-              >
-                <Plus size={16} />
-                <span>+ Create Mock Exam (50+ Qs)</span>
-              </button>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button 
+                  className="btn btn-secondary"
+                  onClick={() => handleOpenAddQuestionModal()}
+                  style={{ gap: '6px' }}
+                >
+                  <Plus size={16} />
+                  <span>+ Add New Question</span>
+                </button>
+                <button 
+                  className="btn btn-primary"
+                  onClick={handleOpenCreateMockModal}
+                  style={{ gap: '6px' }}
+                >
+                  <Target size={16} />
+                  <span>+ Prepare Mock Exam (50+ Qs)</span>
+                </button>
+              </div>
             )}
             {activeTab === 'notes' && (
               <button 
@@ -1240,281 +1418,505 @@ export default function AdminDashboardPage({ navigateTo }) {
               </span>
               <span>All competitive mock exams are strictly enforced with at least 50 questions and negative marking.</span>
             </div>
-            <button
-              className="btn btn-primary"
-              onClick={handleOpenCreateMockModal}
-              style={{ fontSize: '12.5px', padding: '6px 14px', gap: '6px' }}
-            >
-              <Plus size={15} />
-              <span>+ Create 50-Q Mock</span>
-            </button>
-          </div>
-
-          {/* Filters Bar */}
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: '14px',
-            marginBottom: '20px',
-            flexWrap: 'wrap'
-          }}>
-            <div style={{ display: 'flex', gap: '12px', flex: '1', minWidth: '280px', flexWrap: 'wrap' }}>
-              {/* Search */}
-              <div style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '8px',
-                padding: '8px 12px',
-                borderRadius: 'var(--radius-sm)',
-                background: 'var(--bg-card)',
-                border: '1px solid var(--border-subtle)',
-                flex: '1',
-                minWidth: '220px'
-              }}>
-                <Search size={15} color="var(--text-muted)" />
-                <input 
-                  type="text"
-                  placeholder="Search mock exams by title, exam, or category..."
-                  value={mockSearchQuery}
-                  onChange={e => setMockSearchQuery(e.target.value)}
-                  style={{ border: 'none', outline: 'none', background: 'transparent', color: '#fff', fontSize: '13px', width: '100%' }}
-                />
-              </div>
-
-              {/* Category Filter */}
-              <select
-                value={mockCategoryFilter}
-                onChange={e => setMockCategoryFilter(e.target.value)}
-                style={{
-                  padding: '8px 12px',
-                  borderRadius: 'var(--radius-sm)',
-                  background: 'var(--bg-card)',
-                  border: '1px solid var(--border-subtle)',
-                  color: '#fff',
-                  fontSize: '13px',
-                  outline: 'none'
-                }}
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button
+                className="btn btn-secondary"
+                onClick={() => handleOpenAddQuestionModal()}
+                style={{ fontSize: '12.5px', padding: '6px 14px', gap: '6px' }}
               >
-                <option value="All">All Categories</option>
-                <option value="SSC">SSC (CGL, CHSL)</option>
-                <option value="UPSC">UPSC / Civil Services</option>
-                <option value="Railway">Railway / RRB NTPC</option>
-                <option value="Banking">Banking (IBPS, SBI)</option>
-                <option value="Defence">Defence / Police</option>
-                <option value="KPSC">KPSC / State Exams</option>
-                <option value="Central Government">Central Government</option>
-              </select>
-
-              {/* Status Filter */}
-              <select
-                value={mockStatusFilter}
-                onChange={e => setMockStatusFilter(e.target.value)}
-                style={{
-                  padding: '8px 12px',
-                  borderRadius: 'var(--radius-sm)',
-                  background: 'var(--bg-card)',
-                  border: '1px solid var(--border-subtle)',
-                  color: '#fff',
-                  fontSize: '13px',
-                  outline: 'none'
-                }}
-              >
-                <option value="All">All Statuses</option>
-                <option value="published">Published (Live in App)</option>
-                <option value="draft">Drafts Only</option>
-              </select>
-            </div>
-          </div>
-
-          {/* Mock Exams List */}
-          {mockLoading ? (
-            <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
-              Loading mock exams...
-            </div>
-          ) : mockExamsList.length === 0 ? (
-            <div style={{
-              padding: '60px 24px',
-              textAlign: 'center',
-              borderRadius: 'var(--radius-lg)',
-              background: 'var(--bg-card)',
-              border: '1px dashed var(--border-subtle)',
-              margin: '20px 0'
-            }}>
-              <div style={{
-                width: '60px',
-                height: '60px',
-                borderRadius: '50%',
-                background: 'rgba(6, 182, 212, 0.1)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                margin: '0 auto 16px',
-                color: 'var(--cyan)'
-              }}>
-                <Target size={28} />
-              </div>
-              <h3 style={{ fontSize: '17px', fontWeight: 700, color: '#fff', marginBottom: '8px' }}>
-                No Mock Exams Found
-              </h3>
-              <p style={{ color: 'var(--text-secondary)', fontSize: '14px', maxWidth: '440px', margin: '0 auto 20px', lineHeight: 1.5 }}>
-                Create your first full-length mock exam with at least 50 questions across key competitive subjects.
-              </p>
+                <Plus size={15} />
+                <span>+ Add Question</span>
+              </button>
               <button
                 className="btn btn-primary"
                 onClick={handleOpenCreateMockModal}
+                style={{ fontSize: '12.5px', padding: '6px 14px', gap: '6px' }}
               >
-                <Plus size={16} />
-                <span>Create 50-Question Mock Exam</span>
+                <Target size={15} />
+                <span>+ Prepare 50-Q Mock</span>
               </button>
             </div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-              {mockExamsList
-                .filter(exam => {
-                  if (mockCategoryFilter !== 'All' && (exam.category || '').toLowerCase() !== mockCategoryFilter.toLowerCase()) return false;
-                  if (mockStatusFilter !== 'All' && exam.status !== mockStatusFilter) return false;
-                  if (mockSearchQuery.trim()) {
-                    const q = mockSearchQuery.toLowerCase();
-                    return (exam.title || '').toLowerCase().includes(q) || (exam.target_exam || '').toLowerCase().includes(q);
-                  }
-                  return true;
-                })
-                .map(exam => (
-                  <div
-                    key={exam.id}
-                    className="card"
+          </div>
+
+          {/* Sub-Tabs: Mock Exams List vs Question Bank Management */}
+          <div style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
+            <button
+              className={`btn ${mockSubTab === 'exams' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setMockSubTab('exams')}
+              style={{ fontSize: '13px', padding: '8px 18px', gap: '6px' }}
+            >
+              <Target size={16} />
+              <span>Full-Length Mock Exams ({mockExamsList.length})</span>
+            </button>
+            <button
+              className={`btn ${mockSubTab === 'questions' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => {
+                setMockSubTab('questions');
+                fetchQuestionBank(qbSubjectFilter, qbSearchQuery);
+              }}
+              style={{ fontSize: '13px', padding: '8px 18px', gap: '6px' }}
+            >
+              <HelpCircle size={16} />
+              <span>Question Bank & Custom Questions ({questionBank.length > 0 ? questionBank.length : '830+'})</span>
+            </button>
+          </div>
+
+          {/* VIEW A: MOCK EXAMS LIST */}
+          {mockSubTab === 'exams' && (
+            <div>
+              {/* Filters Bar */}
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '14px',
+                marginBottom: '20px',
+                flexWrap: 'wrap'
+              }}>
+                <div style={{ display: 'flex', gap: '12px', flex: '1', minWidth: '280px', flexWrap: 'wrap' }}>
+                  {/* Search */}
+                  <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    padding: '8px 12px',
+                    borderRadius: 'var(--radius-sm)',
+                    background: 'var(--bg-card)',
+                    border: '1px solid var(--border-subtle)',
+                    flex: '1',
+                    minWidth: '220px'
+                  }}>
+                    <Search size={15} color="var(--text-muted)" />
+                    <input 
+                      type="text"
+                      placeholder="Search mock exams by title, exam, or category..."
+                      value={mockSearchQuery}
+                      onChange={e => setMockSearchQuery(e.target.value)}
+                      style={{ border: 'none', outline: 'none', background: 'transparent', color: '#fff', fontSize: '13px', width: '100%' }}
+                    />
+                  </div>
+
+                  {/* Category Filter */}
+                  <select
+                    value={mockCategoryFilter}
+                    onChange={e => setMockCategoryFilter(e.target.value)}
                     style={{
-                      padding: '20px 24px',
-                      borderRadius: 'var(--radius-md)',
+                      padding: '8px 12px',
+                      borderRadius: 'var(--radius-sm)',
                       background: 'var(--bg-card)',
                       border: '1px solid var(--border-subtle)',
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: '14px'
+                      color: '#fff',
+                      fontSize: '13px',
+                      outline: 'none'
                     }}
                   >
-                    <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '16px', flexWrap: 'wrap' }}>
-                      <div style={{ display: 'flex', alignItems: 'flex-start', gap: '14px' }}>
+                    <option value="All">All Categories</option>
+                    <option value="SSC">SSC (CGL, CHSL)</option>
+                    <option value="UPSC">UPSC / Civil Services</option>
+                    <option value="Railway">Railway / RRB NTPC</option>
+                    <option value="Banking">Banking (IBPS, SBI)</option>
+                    <option value="Defence">Defence / Police</option>
+                    <option value="KPSC">KPSC / State Exams</option>
+                    <option value="Central Government">Central Government</option>
+                  </select>
+
+                  {/* Status Filter */}
+                  <select
+                    value={mockStatusFilter}
+                    onChange={e => setMockStatusFilter(e.target.value)}
+                    style={{
+                      padding: '8px 12px',
+                      borderRadius: 'var(--radius-sm)',
+                      background: 'var(--bg-card)',
+                      border: '1px solid var(--border-subtle)',
+                      color: '#fff',
+                      fontSize: '13px',
+                      outline: 'none'
+                    }}
+                  >
+                    <option value="All">All Statuses</option>
+                    <option value="published">Published (Live in App)</option>
+                    <option value="draft">Drafts Only</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Mock Exams List */}
+              {mockLoading ? (
+                <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                  Loading mock exams...
+                </div>
+              ) : mockExamsList.length === 0 ? (
+                <div style={{
+                  padding: '60px 24px',
+                  textAlign: 'center',
+                  borderRadius: 'var(--radius-lg)',
+                  background: 'var(--bg-card)',
+                  border: '1px dashed var(--border-subtle)',
+                  margin: '20px 0'
+                }}>
+                  <div style={{
+                    width: '60px',
+                    height: '60px',
+                    borderRadius: '50%',
+                    background: 'rgba(6, 182, 212, 0.1)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    margin: '0 auto 16px',
+                    color: 'var(--cyan)'
+                  }}>
+                    <Target size={28} />
+                  </div>
+                  <h3 style={{ fontSize: '17px', fontWeight: 700, color: '#fff', marginBottom: '8px' }}>
+                    No Mock Exams Found
+                  </h3>
+                  <p style={{ color: 'var(--text-secondary)', fontSize: '14px', maxWidth: '440px', margin: '0 auto 20px', lineHeight: 1.5 }}>
+                    Create your first full-length mock exam with at least 50 questions across key competitive subjects.
+                  </p>
+                  <button
+                    className="btn btn-primary"
+                    onClick={handleOpenCreateMockModal}
+                  >
+                    <Plus size={16} />
+                    <span>Create 50-Question Mock Exam</span>
+                  </button>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                  {mockExamsList
+                    .filter(exam => {
+                      if (mockCategoryFilter !== 'All' && (exam.category || '').toLowerCase() !== mockCategoryFilter.toLowerCase()) return false;
+                      if (mockStatusFilter !== 'All' && exam.status !== mockStatusFilter) return false;
+                      if (mockSearchQuery.trim()) {
+                        const q = mockSearchQuery.toLowerCase();
+                        return (exam.title || '').toLowerCase().includes(q) || (exam.target_exam || '').toLowerCase().includes(q);
+                      }
+                      return true;
+                    })
+                    .map(exam => (
+                      <div
+                        key={exam.id}
+                        className="card"
+                        style={{
+                          padding: '20px 24px',
+                          borderRadius: 'var(--radius-md)',
+                          background: 'var(--bg-card)',
+                          border: '1px solid var(--border-subtle)',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '14px'
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '16px', flexWrap: 'wrap' }}>
+                          <div style={{ display: 'flex', alignItems: 'flex-start', gap: '14px' }}>
+                            <div style={{
+                              width: '44px',
+                              height: '44px',
+                              borderRadius: '10px',
+                              background: 'rgba(99, 102, 241, 0.12)',
+                              color: 'var(--cyan)',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              flexShrink: 0
+                            }}>
+                              <Target size={24} />
+                            </div>
+                            <div>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: '6px' }}>
+                                <h4 style={{ fontSize: '17px', fontWeight: 700, color: '#fff', margin: 0 }}>
+                                  {exam.title}
+                                </h4>
+                                <span className={`badge ${exam.status === 'published' ? 'badge-emerald' : 'badge-amber'}`}>
+                                  {exam.status === 'published' ? 'Published Live' : 'Draft'}
+                                </span>
+                              </div>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', fontSize: '12px' }}>
+                                <span className="badge badge-primary" style={{ padding: '2px 8px' }}>
+                                  {exam.category || 'General'}
+                                </span>
+                                {exam.target_exam && (
+                                  <span className="badge badge-cyan" style={{ padding: '2px 8px' }}>
+                                    {exam.target_exam}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Action buttons */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <button
+                              className="btn btn-secondary"
+                              onClick={() => handlePreviewMockExam(exam)}
+                              style={{ fontSize: '12.5px', padding: '6px 12px', gap: '5px' }}
+                              title="Preview full 50 questions & answers"
+                            >
+                              <Eye size={14} />
+                              <span>Preview ({exam.total_questions || (exam.question_ids || []).length} Qs)</span>
+                            </button>
+                            <button
+                              className="btn btn-secondary"
+                              onClick={() => handleOpenEditMockModal(exam)}
+                              style={{ fontSize: '12.5px', padding: '6px 12px', gap: '5px' }}
+                              title="Edit exam settings and questions"
+                            >
+                              <Edit2 size={14} />
+                              <span>Edit Exam</span>
+                            </button>
+                            <button
+                              className={`btn ${exam.status === 'published' ? 'btn-secondary' : 'btn-emerald'}`}
+                              onClick={() => handleToggleMockStatus(exam.id, exam.status)}
+                              style={{ fontSize: '12px', padding: '6px 12px' }}
+                              title="Toggle live publication status"
+                            >
+                              {exam.status === 'published' ? 'Unpublish' : 'Publish Live'}
+                            </button>
+                            <button
+                              className="btn btn-secondary"
+                              onClick={() => handleDeleteMockExam(exam.id, exam.title)}
+                              style={{ fontSize: '12px', padding: '6px 10px', color: 'var(--rose)' }}
+                              title="Delete mock exam"
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        </div>
+
+                        {exam.description && (
+                          <p style={{ fontSize: '13.5px', color: 'var(--text-secondary)', margin: 0, lineHeight: 1.45 }}>
+                            {exam.description}
+                          </p>
+                        )}
+
+                        {/* Metadata strip */}
                         <div style={{
-                          width: '44px',
-                          height: '44px',
-                          borderRadius: '10px',
-                          background: 'rgba(99, 102, 241, 0.12)',
-                          color: 'var(--cyan)',
                           display: 'flex',
                           alignItems: 'center',
-                          justifyContent: 'center',
-                          flexShrink: 0
+                          justifyContent: 'space-between',
+                          paddingTop: '12px',
+                          borderTop: '1px solid rgba(255, 255, 255, 0.04)',
+                          fontSize: '12.5px',
+                          color: 'var(--text-muted)',
+                          flexWrap: 'wrap',
+                          gap: '12px'
                         }}>
-                          <Target size={24} />
-                        </div>
-                        <div>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: '6px' }}>
-                            <h4 style={{ fontSize: '17px', fontWeight: 700, color: '#fff', margin: 0 }}>
-                              {exam.title}
-                            </h4>
-                            <span className={`badge ${exam.status === 'published' ? 'badge-emerald' : 'badge-amber'}`}>
-                              {exam.status === 'published' ? 'Published Live' : 'Draft'}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                              <HelpCircle size={14} color="var(--cyan)" />
+                              <strong style={{ color: 'var(--cyan)' }}>{exam.total_questions || (exam.question_ids || []).length} Questions</strong> (Min 50 ✓)
+                            </span>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                              <Clock size={14} />
+                              <strong style={{ color: '#fff' }}>{exam.duration_minutes || 60} Mins</strong>
+                            </span>
+                            <span>
+                              Total Marks: <strong style={{ color: '#fff' }}>{exam.total_marks || (exam.total_questions * 2) || 100}</strong>
+                            </span>
+                            <span>
+                              Negative: <strong style={{ color: 'var(--amber)' }}>-{exam.negative_marking !== undefined ? exam.negative_marking : 0.25}</strong>
+                            </span>
+                            <span>
+                              Pass Req: <strong style={{ color: 'var(--emerald)' }}>{exam.passing_percentage || 70}%</strong>
                             </span>
                           </div>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', fontSize: '12px' }}>
-                            <span className="badge badge-primary" style={{ padding: '2px 8px' }}>
-                              {exam.category || 'General'}
-                            </span>
-                            {exam.target_exam && (
-                              <span className="badge badge-cyan" style={{ padding: '2px 8px' }}>
-                                {exam.target_exam}
-                              </span>
-                            )}
+
+                          <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                            Attempts: <strong style={{ color: '#fff' }}>{exam.attempts_count || 0}</strong>
+                            {exam.attempts_count > 0 && ` • Avg Score: ${exam.average_score}%`}
                           </div>
                         </div>
                       </div>
+                    ))}
+                </div>
+              )}
+            </div>
+          )}
 
-                      {/* Action buttons */}
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                        <button
-                          className="btn btn-secondary"
-                          onClick={() => handlePreviewMockExam(exam)}
-                          style={{ fontSize: '12.5px', padding: '6px 12px', gap: '5px' }}
-                          title="Preview full 50 questions & answers"
-                        >
-                          <Eye size={14} />
-                          <span>Preview Questions</span>
-                        </button>
-                        <button
-                          className="btn btn-secondary"
-                          onClick={() => handleOpenEditMockModal(exam)}
-                          style={{ fontSize: '12.5px', padding: '6px 12px', gap: '5px' }}
-                          title="Edit exam settings"
-                        >
-                          <Edit2 size={14} />
-                          <span>Edit</span>
-                        </button>
-                        <button
-                          className={`btn ${exam.status === 'published' ? 'btn-secondary' : 'btn-emerald'}`}
-                          onClick={() => handleToggleMockStatus(exam.id, exam.status)}
-                          style={{ fontSize: '12px', padding: '6px 12px' }}
-                          title="Toggle live publication status"
-                        >
-                          {exam.status === 'published' ? 'Unpublish' : 'Publish Live'}
-                        </button>
-                        <button
-                          className="btn btn-secondary"
-                          onClick={() => handleDeleteMockExam(exam.id, exam.title)}
-                          style={{ fontSize: '12px', padding: '6px 10px', color: 'var(--rose)' }}
-                          title="Delete mock exam"
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
-                    </div>
-
-                    {exam.description && (
-                      <p style={{ fontSize: '13.5px', color: 'var(--text-secondary)', margin: 0, lineHeight: 1.45 }}>
-                        {exam.description}
-                      </p>
-                    )}
-
-                    {/* Metadata strip */}
-                    <div style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      paddingTop: '12px',
-                      borderTop: '1px solid rgba(255, 255, 255, 0.04)',
-                      fontSize: '12.5px',
-                      color: 'var(--text-muted)',
-                      flexWrap: 'wrap',
-                      gap: '12px'
-                    }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
-                        <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                          <HelpCircle size={14} color="var(--cyan)" />
-                          <strong style={{ color: 'var(--cyan)' }}>{exam.total_questions || (exam.question_ids || []).length} Questions</strong> (Min 50 ✓)
-                        </span>
-                        <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                          <Clock size={14} />
-                          <strong style={{ color: '#fff' }}>{exam.duration_minutes || 60} Mins</strong>
-                        </span>
-                        <span>
-                          Total Marks: <strong style={{ color: '#fff' }}>{exam.total_marks || (exam.total_questions * 2) || 100}</strong>
-                        </span>
-                        <span>
-                          Negative Marking: <strong style={{ color: 'var(--amber)' }}>-{exam.negative_marking !== undefined ? exam.negative_marking : 0.25}</strong>
-                        </span>
-                        <span>
-                          Pass Req: <strong style={{ color: 'var(--emerald)' }}>{exam.passing_percentage || 70}%</strong>
-                        </span>
-                      </div>
-
-                      <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
-                        Attempts: <strong style={{ color: '#fff' }}>{exam.attempts_count || 0}</strong>
-                        {exam.attempts_count > 0 && ` • Avg Score: ${exam.average_score}%`}
-                      </div>
-                    </div>
+          {/* VIEW B: QUESTION BANK & CUSTOM QUESTIONS CONSOLE */}
+          {mockSubTab === 'questions' && (
+            <div>
+              {/* Question Bank Filter & Action Bar */}
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '14px',
+                marginBottom: '20px',
+                flexWrap: 'wrap'
+              }}>
+                <div style={{ display: 'flex', gap: '12px', flex: 1, minWidth: '280px', flexWrap: 'wrap' }}>
+                  <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    padding: '8px 12px',
+                    borderRadius: 'var(--radius-sm)',
+                    background: 'var(--bg-card)',
+                    border: '1px solid var(--border-subtle)',
+                    flex: '1',
+                    minWidth: '220px'
+                  }}>
+                    <Search size={15} color="var(--text-muted)" />
+                    <input 
+                      type="text"
+                      placeholder="Search questions by text, subject, or topic..."
+                      value={qbSearchQuery}
+                      onChange={e => {
+                        setQbSearchQuery(e.target.value);
+                        fetchQuestionBank(qbSubjectFilter, e.target.value);
+                      }}
+                      style={{ border: 'none', outline: 'none', background: 'transparent', color: '#fff', fontSize: '13px', width: '100%' }}
+                    />
                   </div>
-                ))}
+
+                  <select
+                    value={qbSubjectFilter}
+                    onChange={e => {
+                      setQbSubjectFilter(e.target.value);
+                      fetchQuestionBank(e.target.value, qbSearchQuery);
+                    }}
+                    style={{
+                      padding: '8px 12px',
+                      borderRadius: 'var(--radius-sm)',
+                      background: 'var(--bg-card)',
+                      border: '1px solid var(--border-subtle)',
+                      color: '#fff',
+                      fontSize: '13px',
+                      outline: 'none'
+                    }}
+                  >
+                    <option value="All">All Subjects (830+ Qs)</option>
+                    <option value="English">English Language</option>
+                    <option value="Math">Quantitative Aptitude</option>
+                    <option value="Reason">Reasoning Ability</option>
+                    <option value="Awareness">General Awareness</option>
+                    <option value="Science">General Science</option>
+                  </select>
+                </div>
+
+                <button
+                  className="btn btn-primary"
+                  onClick={() => handleOpenAddQuestionModal(qbSubjectFilter !== 'All' ? qbSubjectFilter : 'Quantitative Aptitude')}
+                  style={{ gap: '6px', fontSize: '13px' }}
+                >
+                  <Plus size={16} />
+                  <span>+ Add New Question</span>
+                </button>
+              </div>
+
+              {/* Questions List */}
+              {questionBank.length === 0 ? (
+                <div style={{ padding: '60px 20px', textAlign: 'center', color: 'var(--text-muted)', background: 'var(--bg-card)', borderRadius: 'var(--radius-md)', border: '1px dashed var(--border-subtle)' }}>
+                  Loading question bank questions...
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                  {questionBank.map((q, idx) => (
+                    <div
+                      key={q.id || idx}
+                      style={{
+                        padding: '18px 22px',
+                        borderRadius: 'var(--radius-md)',
+                        background: 'var(--bg-card)',
+                        border: '1px solid var(--border-subtle)'
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px', flexWrap: 'wrap', gap: '8px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span style={{
+                            width: '24px',
+                            height: '24px',
+                            borderRadius: '50%',
+                            background: 'rgba(6, 182, 212, 0.12)',
+                            color: 'var(--cyan)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            fontSize: '11.5px',
+                            fontWeight: 700
+                          }}>
+                            {idx + 1}
+                          </span>
+                          <span className="badge badge-primary" style={{ fontSize: '11px' }}>
+                            {q.subject || 'General'}
+                          </span>
+                          {q.topic && (
+                            <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                              {q.topic}
+                            </span>
+                          )}
+                          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                            ID #{q.id} • {q.points || 2} Marks
+                          </span>
+                        </div>
+
+                        <button
+                          className="btn btn-secondary"
+                          onClick={() => handleDeleteQuestion(q.id, q.question)}
+                          style={{ fontSize: '11.5px', padding: '4px 10px', color: 'var(--rose)' }}
+                          title="Delete question from database"
+                        >
+                          <Trash2 size={13} />
+                          <span>Delete</span>
+                        </button>
+                      </div>
+
+                      <h4 style={{ fontSize: '14.5px', fontWeight: 600, color: '#fff', margin: '0 0 12px', lineHeight: 1.5 }}>
+                        {q.question}
+                      </h4>
+
+                      {/* Options */}
+                      {Array.isArray(q.options_json) && q.options_json.length > 0 ? (
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '8px', marginBottom: '10px' }}>
+                          {q.options_json.map((opt, oIdx) => {
+                            const isCorrect = opt === q.correct_answer || (q.correct_answer && String(opt).startsWith(q.correct_answer));
+                            return (
+                              <div
+                                key={oIdx}
+                                style={{
+                                  padding: '7px 12px',
+                                  borderRadius: '6px',
+                                  background: isCorrect ? 'rgba(16, 185, 129, 0.1)' : 'rgba(255, 255, 255, 0.02)',
+                                  border: `1px solid ${isCorrect ? 'rgba(16, 185, 129, 0.35)' : 'rgba(255, 255, 255, 0.05)'}`,
+                                  color: isCorrect ? 'var(--emerald)' : 'var(--text-secondary)',
+                                  fontSize: '12.5px',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '8px'
+                                }}
+                              >
+                                <span style={{ fontWeight: 700, width: '16px' }}>{String.fromCharCode(65 + oIdx)}.</span>
+                                <span>{opt}</span>
+                                {isCorrect && <Check size={14} style={{ marginLeft: 'auto' }} />}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div style={{ fontSize: '12.5px', color: 'var(--text-muted)', marginBottom: '10px' }}>
+                          Direct Answer / Fill-in-the-blank: <strong style={{ color: 'var(--emerald)' }}>{q.correct_answer}</strong>
+                        </div>
+                      )}
+
+                      {q.explanation && (
+                        <div style={{
+                          padding: '8px 12px',
+                          borderRadius: '6px',
+                          background: 'rgba(6, 182, 212, 0.06)',
+                          border: '1px solid rgba(6, 182, 212, 0.15)',
+                          fontSize: '12px',
+                          color: 'var(--text-secondary)'
+                        }}>
+                          <strong style={{ color: 'var(--cyan)' }}>Explanation: </strong>
+                          {q.explanation}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -3894,100 +4296,107 @@ export default function AdminDashboardPage({ navigateTo }) {
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px', flexWrap: 'wrap', gap: '12px' }}>
                     <div>
                       <h4 style={{ margin: 0, fontSize: '15px', fontWeight: 700, color: '#fff', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                        <span>50-Question Composition Strategy</span>
-                        <span className="badge badge-emerald" style={{ fontSize: '11px' }}>Minimum 50 Mandatory</span>
+                        <span>Prepare Mock Exam Questions</span>
+                        <span className={`badge ${mockForm.selected_question_ids.length >= 50 ? 'badge-emerald' : 'badge-amber'}`} style={{ fontSize: '11px' }}>
+                          {mockForm.selected_question_ids.length} / 50 Minimum Mandatory
+                        </span>
                       </h4>
                       <div style={{ fontSize: '12.5px', color: 'var(--text-secondary)', marginTop: '3px' }}>
-                        Choose whether to auto-assemble 50+ questions across core subjects or pick specific questions manually.
+                        Combine fast 1-click competitive presets, select from 830+ bank questions, and compose custom questions.
                       </div>
                     </div>
 
-                    {/* Mode Toggle Buttons */}
+                    {/* Mode / Method Selector Tabs */}
                     <div style={{ display: 'flex', gap: '6px', background: 'var(--bg-card)', padding: '4px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)' }}>
                       <button
                         type="button"
-                        className={`btn ${mockForm.creation_mode === 'auto' ? 'btn-primary' : 'btn-secondary'}`}
-                        onClick={() => setMockForm({ ...mockForm, creation_mode: 'auto' })}
-                        style={{ padding: '6px 14px', fontSize: '12.5px' }}
+                        className={`btn ${activePreparedTab === 'auto' ? 'btn-primary' : 'btn-secondary'}`}
+                        onClick={() => setActivePreparedTab('auto')}
+                        style={{ padding: '6px 12px', fontSize: '12px', gap: '5px' }}
                       >
-                        ⚡ Smart Auto-Assembly (50+ Qs)
+                        <Sparkles size={13} />
+                        <span>⚡ 1-Click Fast Presets (50 Qs)</span>
                       </button>
                       <button
                         type="button"
-                        className={`btn ${mockForm.creation_mode === 'manual' ? 'btn-primary' : 'btn-secondary'}`}
+                        className={`btn ${activePreparedTab === 'bank' ? 'btn-primary' : 'btn-secondary'}`}
                         onClick={() => {
-                          setMockForm({ ...mockForm, creation_mode: 'manual' });
+                          setActivePreparedTab('bank');
                           if (questionBank.length === 0) fetchQuestionBank('All', '');
                         }}
-                        style={{ padding: '6px 14px', fontSize: '12.5px' }}
+                        style={{ padding: '6px 12px', fontSize: '12px', gap: '5px' }}
                       >
-                        📋 Manual Selection ({mockForm.selected_question_ids.length}/50)
+                        <BookOpen size={13} />
+                        <span>📋 Question Bank ({questionBank.length > 0 ? questionBank.length : '830+'})</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={`btn ${activePreparedTab === 'author' ? 'btn-primary' : 'btn-secondary'}`}
+                        onClick={() => setActivePreparedTab('author')}
+                        style={{ padding: '6px 12px', fontSize: '12px', gap: '5px' }}
+                      >
+                        <Edit2 size={13} />
+                        <span>✍️ Author Questions</span>
                       </button>
                     </div>
                   </div>
 
-                  {/* MODE A: SMART AUTO-ASSEMBLY */}
-                  {mockForm.creation_mode === 'auto' && (
-                    <div>
-                      {/* Quick Preset Pills */}
-                      <div style={{ marginBottom: '16px' }}>
-                        <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '8px', fontWeight: 600 }}>
-                          QUICK COMPETITIVE PRESETS (Auto-configures 50 questions):
-                        </div>
-                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                          <button
-                            type="button"
-                            className="btn btn-secondary"
-                            onClick={() => setMockForm({
-                              ...mockForm,
-                              subject_distribution: { english: 15, math: 15, reasoning: 10, general_awareness: 10 }
-                            })}
-                            style={{ fontSize: '12px', padding: '5px 12px' }}
-                          >
-                            🎯 SSC Tier-1 Pattern (15-15-10-10 = 50 Qs)
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-secondary"
-                            onClick={() => setMockForm({
-                              ...mockForm,
-                              subject_distribution: { english: 10, math: 15, reasoning: 15, general_awareness: 10 }
-                            })}
-                            style={{ fontSize: '12px', padding: '5px 12px' }}
-                          >
-                            🚂 Railway RRB NTPC (10-15-15-10 = 50 Qs)
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-secondary"
-                            onClick={() => setMockForm({
-                              ...mockForm,
-                              subject_distribution: { english: 20, math: 15, reasoning: 15, general_awareness: 0 }
-                            })}
-                            style={{ fontSize: '12px', padding: '5px 12px' }}
-                          >
-                            🏦 Banking Prelims (20-15-15-0 = 50 Qs)
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-secondary"
-                            onClick={() => setMockForm({
-                              ...mockForm,
-                              subject_distribution: { english: 12, math: 13, reasoning: 13, general_awareness: 12 }
-                            })}
-                            style={{ fontSize: '12px', padding: '5px 12px' }}
-                          >
-                            ⚖️ Balanced 5-Subject (12-13-13-12 = 50 Qs)
-                          </button>
-                        </div>
+                  {/* TAB 1: 1-CLICK FAST PRESETS */}
+                  {activePreparedTab === 'auto' && (
+                    <div style={{ background: 'rgba(255, 255, 255, 0.02)', padding: '16px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)', marginBottom: '16px' }}>
+                      <div style={{ fontSize: '12px', color: 'var(--cyan)', marginBottom: '10px', fontWeight: 700, letterSpacing: '0.5px' }}>
+                        CLICK A PRESET TO INSTANTLY LOAD 50 VERIFIED QUESTIONS:
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '10px', marginBottom: '16px' }}>
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          onClick={() => handleApplyPreset('ssc')}
+                          disabled={autoAssembling}
+                          style={{ fontSize: '12px', padding: '10px 14px', justifyContent: 'flex-start', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: '3px' }}
+                        >
+                          <span style={{ fontWeight: 700, color: '#fff' }}>🎯 SSC Tier-1 Pattern</span>
+                          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>15 Eng + 15 Math + 10 Reas + 10 GA = 50 Qs</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          onClick={() => handleApplyPreset('railway')}
+                          disabled={autoAssembling}
+                          style={{ fontSize: '12px', padding: '10px 14px', justifyContent: 'flex-start', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: '3px' }}
+                        >
+                          <span style={{ fontWeight: 700, color: '#fff' }}>🚂 Railway RRB NTPC Pattern</span>
+                          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>10 Eng + 15 Math + 15 Reas + 10 GA = 50 Qs</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          onClick={() => handleApplyPreset('banking')}
+                          disabled={autoAssembling}
+                          style={{ fontSize: '12px', padding: '10px 14px', justifyContent: 'flex-start', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: '3px' }}
+                        >
+                          <span style={{ fontWeight: 700, color: '#fff' }}>🏦 Banking Prelims Pattern</span>
+                          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>20 Eng + 15 Math + 15 Reas = 50 Qs</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          onClick={() => handleApplyPreset('balanced')}
+                          disabled={autoAssembling}
+                          style={{ fontSize: '12px', padding: '10px 14px', justifyContent: 'flex-start', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: '3px' }}
+                        >
+                          <span style={{ fontWeight: 700, color: '#fff' }}>⚖️ Balanced 4-Subject</span>
+                          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>12 Eng + 13 Math + 13 Reas + 12 GA = 50 Qs</span>
+                        </button>
                       </div>
 
-                      {/* Subject Spinners */}
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: '14px', marginBottom: '16px' }}>
-                        <div style={{ padding: '12px', borderRadius: 'var(--radius-sm)', background: 'var(--bg-card)', border: '1px solid var(--border-subtle)' }}>
-                          <label style={{ display: 'block', fontSize: '12px', color: 'var(--cyan)', fontWeight: 600, marginBottom: '6px' }}>
-                            English Language
-                          </label>
+                      {/* Custom Distribution Adjusters */}
+                      <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '8px', fontWeight: 600 }}>
+                        Or customize subject questions balance:
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '10px', marginBottom: '12px' }}>
+                        <div style={{ padding: '8px 12px', borderRadius: '4px', background: 'var(--bg-card)', border: '1px solid var(--border-subtle)' }}>
+                          <label style={{ display: 'block', fontSize: '11px', color: 'var(--cyan)', fontWeight: 600, marginBottom: '4px' }}>English</label>
                           <input
                             type="number"
                             min="0"
@@ -3997,14 +4406,11 @@ export default function AdminDashboardPage({ navigateTo }) {
                               ...mockForm,
                               subject_distribution: { ...mockForm.subject_distribution, english: parseInt(e.target.value, 10) || 0 }
                             })}
-                            style={{ width: '100%', padding: '6px 10px', background: '#0f172a', border: '1px solid var(--border-subtle)', borderRadius: '4px', color: '#fff', fontSize: '13px' }}
+                            style={{ width: '100%', padding: '4px 8px', background: '#0f172a', border: '1px solid var(--border-subtle)', borderRadius: '4px', color: '#fff', fontSize: '12.5px' }}
                           />
                         </div>
-
-                        <div style={{ padding: '12px', borderRadius: 'var(--radius-sm)', background: 'var(--bg-card)', border: '1px solid var(--border-subtle)' }}>
-                          <label style={{ display: 'block', fontSize: '12px', color: 'var(--primary-light)', fontWeight: 600, marginBottom: '6px' }}>
-                            Mathematics / Quant
-                          </label>
+                        <div style={{ padding: '8px 12px', borderRadius: '4px', background: 'var(--bg-card)', border: '1px solid var(--border-subtle)' }}>
+                          <label style={{ display: 'block', fontSize: '11px', color: 'var(--primary-light)', fontWeight: 600, marginBottom: '4px' }}>Math / Quant</label>
                           <input
                             type="number"
                             min="0"
@@ -4014,14 +4420,11 @@ export default function AdminDashboardPage({ navigateTo }) {
                               ...mockForm,
                               subject_distribution: { ...mockForm.subject_distribution, math: parseInt(e.target.value, 10) || 0 }
                             })}
-                            style={{ width: '100%', padding: '6px 10px', background: '#0f172a', border: '1px solid var(--border-subtle)', borderRadius: '4px', color: '#fff', fontSize: '13px' }}
+                            style={{ width: '100%', padding: '4px 8px', background: '#0f172a', border: '1px solid var(--border-subtle)', borderRadius: '4px', color: '#fff', fontSize: '12.5px' }}
                           />
                         </div>
-
-                        <div style={{ padding: '12px', borderRadius: 'var(--radius-sm)', background: 'var(--bg-card)', border: '1px solid var(--border-subtle)' }}>
-                          <label style={{ display: 'block', fontSize: '12px', color: 'var(--amber)', fontWeight: 600, marginBottom: '6px' }}>
-                            Reasoning Ability
-                          </label>
+                        <div style={{ padding: '8px 12px', borderRadius: '4px', background: 'var(--bg-card)', border: '1px solid var(--border-subtle)' }}>
+                          <label style={{ display: 'block', fontSize: '11px', color: 'var(--amber)', fontWeight: 600, marginBottom: '4px' }}>Reasoning</label>
                           <input
                             type="number"
                             min="0"
@@ -4031,14 +4434,11 @@ export default function AdminDashboardPage({ navigateTo }) {
                               ...mockForm,
                               subject_distribution: { ...mockForm.subject_distribution, reasoning: parseInt(e.target.value, 10) || 0 }
                             })}
-                            style={{ width: '100%', padding: '6px 10px', background: '#0f172a', border: '1px solid var(--border-subtle)', borderRadius: '4px', color: '#fff', fontSize: '13px' }}
+                            style={{ width: '100%', padding: '4px 8px', background: '#0f172a', border: '1px solid var(--border-subtle)', borderRadius: '4px', color: '#fff', fontSize: '12.5px' }}
                           />
                         </div>
-
-                        <div style={{ padding: '12px', borderRadius: 'var(--radius-sm)', background: 'var(--bg-card)', border: '1px solid var(--border-subtle)' }}>
-                          <label style={{ display: 'block', fontSize: '12px', color: 'var(--emerald)', fontWeight: 600, marginBottom: '6px' }}>
-                            General Awareness
-                          </label>
+                        <div style={{ padding: '8px 12px', borderRadius: '4px', background: 'var(--bg-card)', border: '1px solid var(--border-subtle)' }}>
+                          <label style={{ display: 'block', fontSize: '11px', color: 'var(--emerald)', fontWeight: 600, marginBottom: '4px' }}>General Aware.</label>
                           <input
                             type="number"
                             min="0"
@@ -4048,153 +4448,130 @@ export default function AdminDashboardPage({ navigateTo }) {
                               ...mockForm,
                               subject_distribution: { ...mockForm.subject_distribution, general_awareness: parseInt(e.target.value, 10) || 0 }
                             })}
-                            style={{ width: '100%', padding: '6px 10px', background: '#0f172a', border: '1px solid var(--border-subtle)', borderRadius: '4px', color: '#fff', fontSize: '13px' }}
+                            style={{ width: '100%', padding: '4px 8px', background: '#0f172a', border: '1px solid var(--border-subtle)', borderRadius: '4px', color: '#fff', fontSize: '12.5px' }}
                           />
                         </div>
                       </div>
 
-                      {/* Live Auto Sum Status */}
-                      {(() => {
-                        const sum = (parseInt(mockForm.subject_distribution.english, 10) || 0) +
-                                    (parseInt(mockForm.subject_distribution.math, 10) || 0) +
-                                    (parseInt(mockForm.subject_distribution.reasoning, 10) || 0) +
-                                    (parseInt(mockForm.subject_distribution.general_awareness, 10) || 0);
-                        const isMet = sum >= 50;
-                        return (
-                          <div style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'space-between',
-                            padding: '10px 16px',
-                            borderRadius: 'var(--radius-sm)',
-                            background: isMet ? 'rgba(16, 185, 129, 0.1)' : 'rgba(245, 158, 11, 0.1)',
-                            border: `1px solid ${isMet ? 'rgba(16, 185, 129, 0.3)' : 'rgba(245, 158, 11, 0.3)'}`
-                          }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}>
-                              {isMet ? <CheckCircle2 size={16} color="var(--emerald)" /> : <AlertTriangle size={16} color="var(--amber)" />}
-                              <span style={{ color: isMet ? 'var(--emerald)' : 'var(--amber)', fontWeight: 600 }}>
-                                Total Planned Questions: {sum} / 50 minimum
-                              </span>
-                            </div>
-                            <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
-                              {isMet ? '✓ Valid 50-Question Mock Composition' : `⚠️ Need at least ${50 - sum} more questions to meet the 50 minimum`}
-                            </span>
-                          </div>
-                        );
-                      })()}
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        onClick={async () => {
+                          try {
+                            setAutoAssembling(true);
+                            const res = await fetch('http://localhost:3001/api/admin/mock-exams/generate-set', {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json', 'x-user-role': 'admin' },
+                              body: JSON.stringify({ subject_distribution: mockForm.subject_distribution })
+                            });
+                            if (res.ok) {
+                              const json = await res.json();
+                              setMockForm(prev => ({ ...prev, selected_question_ids: json.question_ids || [] }));
+                            }
+                          } catch (err) {
+                            console.error('Error generating custom set:', err);
+                          } finally {
+                            setAutoAssembling(false);
+                          }
+                        }}
+                        disabled={autoAssembling}
+                        style={{ fontSize: '12px', padding: '6px 14px', gap: '6px' }}
+                      >
+                        <Sparkles size={14} color="var(--cyan)" />
+                        <span>{autoAssembling ? 'Assembling 50 Questions...' : 'Assemble Questions from Distribution'}</span>
+                      </button>
                     </div>
                   )}
 
-                  {/* MODE B: QUESTION BANK MANUAL SELECTION */}
-                  {mockForm.creation_mode === 'manual' && (
-                    <div>
-                      {/* Selection Status Banner */}
-                      <div style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'space-between',
-                        padding: '10px 16px',
-                        borderRadius: 'var(--radius-sm)',
-                        background: mockForm.selected_question_ids.length >= 50 ? 'rgba(16, 185, 129, 0.1)' : 'rgba(245, 158, 11, 0.1)',
-                        border: `1px solid ${mockForm.selected_question_ids.length >= 50 ? 'rgba(16, 185, 129, 0.3)' : 'rgba(245, 158, 11, 0.3)'}`,
-                        marginBottom: '14px'
-                      }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}>
-                          {mockForm.selected_question_ids.length >= 50 ? (
-                            <CheckCircle2 size={16} color="var(--emerald)" />
-                          ) : (
-                            <AlertTriangle size={16} color="var(--amber)" />
-                          )}
-                          <span style={{ color: mockForm.selected_question_ids.length >= 50 ? 'var(--emerald)' : 'var(--amber)', fontWeight: 700 }}>
-                            Selected: {mockForm.selected_question_ids.length} / 50 Questions Minimum
-                          </span>
+                  {/* TAB 2: QUESTION BANK BROWSER */}
+                  {activePreparedTab === 'bank' && (
+                    <div style={{ background: 'rgba(255, 255, 255, 0.02)', padding: '16px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)', marginBottom: '16px' }}>
+                      <div style={{ display: 'flex', gap: '10px', marginBottom: '12px', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <div style={{ display: 'flex', gap: '8px', flex: 1, minWidth: '240px' }}>
+                          <div style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '6px',
+                            padding: '6px 10px',
+                            background: 'var(--bg-card)',
+                            borderRadius: 'var(--radius-sm)',
+                            border: '1px solid var(--border-subtle)',
+                            flex: 1
+                          }}>
+                            <Search size={14} color="var(--text-muted)" />
+                            <input
+                              type="text"
+                              placeholder="Search questions by text or topic..."
+                              value={qbSearchQuery}
+                              onChange={e => {
+                                setQbSearchQuery(e.target.value);
+                                fetchQuestionBank(qbSubjectFilter, e.target.value);
+                              }}
+                              style={{ border: 'none', outline: 'none', background: 'transparent', color: '#fff', fontSize: '12.5px', width: '100%' }}
+                            />
+                          </div>
+
+                          <select
+                            value={qbSubjectFilter}
+                            onChange={e => {
+                              setQbSubjectFilter(e.target.value);
+                              fetchQuestionBank(e.target.value, qbSearchQuery);
+                            }}
+                            style={{
+                              padding: '6px 10px',
+                              background: 'var(--bg-card)',
+                              borderRadius: 'var(--radius-sm)',
+                              border: '1px solid var(--border-subtle)',
+                              color: '#fff',
+                              fontSize: '12px'
+                            }}
+                          >
+                            <option value="All">All Subjects (830+ Qs)</option>
+                            <option value="English">English</option>
+                            <option value="Math">Quantitative Aptitude</option>
+                            <option value="Reason">Reasoning</option>
+                            <option value="Awareness">General Awareness</option>
+                          </select>
                         </div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+
+                        <div style={{ display: 'flex', gap: '8px' }}>
                           <button
                             type="button"
                             className="btn btn-secondary"
                             onClick={() => {
-                              // Select first 50 questions from questionBank
                               const first50 = questionBank.slice(0, 50).map(q => q.id);
-                              setMockForm({ ...mockForm, selected_question_ids: Array.from(new Set([...mockForm.selected_question_ids, ...first50])) });
+                              setMockForm(prev => ({
+                                ...prev,
+                                selected_question_ids: Array.from(new Set([...prev.selected_question_ids, ...first50]))
+                              }));
                             }}
-                            style={{ fontSize: '11.5px', padding: '4px 10px' }}
+                            style={{ fontSize: '11.5px', padding: '5px 10px' }}
                           >
                             + Select Top 50
                           </button>
                           <button
                             type="button"
                             className="btn btn-secondary"
-                            onClick={() => setMockForm({ ...mockForm, selected_question_ids: [] })}
-                            style={{ fontSize: '11.5px', padding: '4px 10px', color: 'var(--text-muted)' }}
+                            onClick={() => setMockForm(prev => ({ ...prev, selected_question_ids: [] }))}
+                            style={{ fontSize: '11.5px', padding: '5px 10px', color: 'var(--text-muted)' }}
                           >
                             Clear All
                           </button>
                         </div>
                       </div>
 
-                      {/* Question Bank Filters */}
-                      <div style={{ display: 'flex', gap: '10px', marginBottom: '12px', flexWrap: 'wrap' }}>
-                        <div style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: '6px',
-                          padding: '6px 10px',
-                          background: 'var(--bg-card)',
-                          borderRadius: 'var(--radius-sm)',
-                          border: '1px solid var(--border-subtle)',
-                          flex: 1,
-                          minWidth: '200px'
-                        }}>
-                          <Search size={14} color="var(--text-muted)" />
-                          <input
-                            type="text"
-                            placeholder="Search questions by keyword..."
-                            value={qbSearchQuery}
-                            onChange={e => {
-                              setQbSearchQuery(e.target.value);
-                              fetchQuestionBank(qbSubjectFilter, e.target.value);
-                            }}
-                            style={{ border: 'none', outline: 'none', background: 'transparent', color: '#fff', fontSize: '12.5px', width: '100%' }}
-                          />
-                        </div>
-
-                        <select
-                          value={qbSubjectFilter}
-                          onChange={e => {
-                            setQbSubjectFilter(e.target.value);
-                            fetchQuestionBank(e.target.value, qbSearchQuery);
-                          }}
-                          style={{
-                            padding: '6px 12px',
-                            background: 'var(--bg-card)',
-                            borderRadius: 'var(--radius-sm)',
-                            border: '1px solid var(--border-subtle)',
-                            color: '#fff',
-                            fontSize: '12.5px'
-                          }}
-                        >
-                          <option value="All">All Subjects (830+ Qs)</option>
-                          <option value="English">English Language</option>
-                          <option value="Math">Quantitative Aptitude</option>
-                          <option value="Reason">Reasoning Ability</option>
-                          <option value="Awareness">General Awareness</option>
-                          <option value="Science">General Science</option>
-                        </select>
-                      </div>
-
-                      {/* Question Bank Scrollable List */}
+                      {/* Scrollable list */}
                       <div style={{
-                        maxHeight: '260px',
+                        maxHeight: '220px',
                         overflowY: 'auto',
                         border: '1px solid var(--border-subtle)',
                         borderRadius: 'var(--radius-sm)',
                         background: '#0b1120',
-                        padding: '8px'
+                        padding: '6px'
                       }}>
                         {questionBank.length === 0 ? (
-                          <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '12.5px' }}>
-                            Loading questions from question bank...
+                          <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '12.5px' }}>
+                            Loading question bank questions...
                           </div>
                         ) : (
                           questionBank.map(q => {
@@ -4204,27 +4581,26 @@ export default function AdminDashboardPage({ navigateTo }) {
                                 key={q.id}
                                 onClick={() => {
                                   if (isSelected) {
-                                    setMockForm({
-                                      ...mockForm,
-                                      selected_question_ids: mockForm.selected_question_ids.filter(id => id !== q.id)
-                                    });
+                                    setMockForm(prev => ({
+                                      ...prev,
+                                      selected_question_ids: prev.selected_question_ids.filter(id => id !== q.id)
+                                    }));
                                   } else {
-                                    setMockForm({
-                                      ...mockForm,
-                                      selected_question_ids: [...mockForm.selected_question_ids, q.id]
-                                    });
+                                    setMockForm(prev => ({
+                                      ...prev,
+                                      selected_question_ids: [...prev.selected_question_ids, q.id]
+                                    }));
                                   }
                                 }}
                                 style={{
                                   display: 'flex',
                                   alignItems: 'flex-start',
                                   gap: '10px',
-                                  padding: '8px 10px',
+                                  padding: '7px 10px',
                                   borderRadius: '4px',
-                                  background: isSelected ? 'rgba(6, 182, 212, 0.1)' : 'transparent',
+                                  background: isSelected ? 'rgba(6, 182, 212, 0.12)' : 'transparent',
                                   borderBottom: '1px solid rgba(255, 255, 255, 0.03)',
-                                  cursor: 'pointer',
-                                  transition: 'background 0.15s ease'
+                                  cursor: 'pointer'
                                 }}
                               >
                                 <input
@@ -4234,15 +4610,15 @@ export default function AdminDashboardPage({ navigateTo }) {
                                   style={{ marginTop: '3px', cursor: 'pointer' }}
                                 />
                                 <div style={{ flex: 1, minWidth: 0 }}>
-                                  <div style={{ fontSize: '13px', color: isSelected ? '#fff' : 'var(--text-secondary)', lineHeight: 1.4 }}>
+                                  <div style={{ fontSize: '12.5px', color: isSelected ? '#fff' : 'var(--text-secondary)', lineHeight: 1.4 }}>
                                     {q.question}
                                   </div>
-                                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '4px', fontSize: '11px', color: 'var(--text-muted)' }}>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '3px', fontSize: '11px', color: 'var(--text-muted)' }}>
                                     <span style={{ color: 'var(--cyan)' }}>{q.subject || 'General'}</span>
                                     <span>•</span>
                                     <span>{q.topic || 'General'}</span>
                                     <span>•</span>
-                                    <span style={{ color: 'var(--emerald)' }}>Answer: {q.correct_answer}</span>
+                                    <span style={{ color: 'var(--emerald)' }}>Ans: {q.correct_answer}</span>
                                   </div>
                                 </div>
                               </div>
@@ -4252,6 +4628,166 @@ export default function AdminDashboardPage({ navigateTo }) {
                       </div>
                     </div>
                   )}
+
+                  {/* TAB 3: ADMIN QUESTION AUTHORING */}
+                  {activePreparedTab === 'author' && (
+                    <div style={{ background: 'rgba(255, 255, 255, 0.02)', padding: '16px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)', marginBottom: '16px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '12px' }}>
+                        <div>
+                          <div style={{ fontWeight: 700, fontSize: '13.5px', color: '#fff', marginBottom: '3px' }}>
+                            ✍️ Author Custom Questions for this Mock Exam
+                          </div>
+                          <div style={{ fontSize: '12px', color: 'var(--text-secondary)', maxWidth: '520px', lineHeight: 1.4 }}>
+                            Write your own question prompt, MCQ choices A/B/C/D, correct answer, subject, marks, and explanation. Newly composed questions are saved to the persistent Question Bank and automatically added to this mock exam.
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          className="btn btn-primary"
+                          onClick={() => handleOpenAddQuestionModal()}
+                          style={{ padding: '8px 16px', fontSize: '13px', gap: '6px' }}
+                        >
+                          <Plus size={16} />
+                          <span>+ Write & Add New Question</span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* CURRENTLY PREPARED QUESTIONS LIST & LIVE VALIDATION */}
+                  <div style={{
+                    padding: '14px 18px',
+                    borderRadius: 'var(--radius-sm)',
+                    background: mockForm.selected_question_ids.length >= 50 ? 'rgba(16, 185, 129, 0.08)' : 'rgba(245, 158, 11, 0.08)',
+                    border: `1px solid ${mockForm.selected_question_ids.length >= 50 ? 'rgba(16, 185, 129, 0.3)' : 'rgba(245, 158, 11, 0.3)'}`
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px', flexWrap: 'wrap', gap: '8px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        {mockForm.selected_question_ids.length >= 50 ? (
+                          <CheckCircle2 size={18} color="var(--emerald)" />
+                        ) : (
+                          <AlertTriangle size={18} color="var(--amber)" />
+                        )}
+                        <span style={{ fontSize: '13.5px', fontWeight: 700, color: mockForm.selected_question_ids.length >= 50 ? 'var(--emerald)' : 'var(--amber)' }}>
+                          Prepared Questions: {mockForm.selected_question_ids.length} / 50 Minimum Mandatory
+                        </span>
+                        {mockForm.selected_question_ids.length >= 50 ? (
+                          <span style={{ fontSize: '12px', color: 'var(--emerald)' }}>✓ Full 50-Question Mock Ready!</span>
+                        ) : (
+                          <span style={{ fontSize: '12px', color: 'var(--amber)' }}>
+                            (Requires at least {50 - mockForm.selected_question_ids.length} more questions)
+                          </span>
+                        )}
+                      </div>
+
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          onClick={() => handleOpenAddQuestionModal()}
+                          style={{ fontSize: '11.5px', padding: '4px 10px', gap: '4px' }}
+                        >
+                          <Plus size={13} />
+                          <span>Add Question</span>
+                        </button>
+                        {mockForm.selected_question_ids.length > 0 && (
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            onClick={() => setMockForm(prev => ({ ...prev, selected_question_ids: [] }))}
+                            style={{ fontSize: '11.5px', padding: '4px 10px', color: 'var(--text-muted)' }}
+                          >
+                            Clear All ({mockForm.selected_question_ids.length})
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Preview of Prepared Questions with Remove Buttons */}
+                    {mockForm.selected_question_ids.length === 0 ? (
+                      <div style={{ padding: '16px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '12.5px' }}>
+                        No questions prepared yet. Click one of the <strong>⚡ 1-Click Fast Presets</strong> above to instantly load 50 questions, or select from the Question Bank.
+                      </div>
+                    ) : (
+                      <div style={{
+                        maxHeight: '180px',
+                        overflowY: 'auto',
+                        background: '#070d18',
+                        borderRadius: '6px',
+                        padding: '6px',
+                        border: '1px solid rgba(255, 255, 255, 0.05)'
+                      }}>
+                        {mockForm.selected_question_ids.map((qid, idx) => {
+                          const qData = questionBank.find(q => q.id === qid);
+                          return (
+                            <div
+                              key={`${qid}-${idx}`}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                                gap: '10px',
+                                padding: '6px 10px',
+                                borderRadius: '4px',
+                                background: 'rgba(255, 255, 255, 0.02)',
+                                borderBottom: '1px solid rgba(255, 255, 255, 0.03)',
+                                fontSize: '12px'
+                              }}
+                            >
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0, flex: 1 }}>
+                                <span style={{
+                                  width: '20px',
+                                  height: '20px',
+                                  borderRadius: '50%',
+                                  background: 'rgba(6, 182, 212, 0.15)',
+                                  color: 'var(--cyan)',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  fontSize: '10.5px',
+                                  fontWeight: 700,
+                                  flexShrink: 0
+                                }}>
+                                  {idx + 1}
+                                </span>
+                                {qData?.subject && (
+                                  <span className="badge badge-primary" style={{ fontSize: '10px', padding: '1px 6px', flexShrink: 0 }}>
+                                    {qData.subject}
+                                  </span>
+                                )}
+                                <span style={{ color: '#fff', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                  {qData?.question || `Verified Bank Question #${qid}`}
+                                </span>
+                              </div>
+
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setMockForm(prev => ({
+                                    ...prev,
+                                    selected_question_ids: prev.selected_question_ids.filter((_, i) => i !== idx)
+                                  }));
+                                }}
+                                style={{
+                                  background: 'none',
+                                  border: 'none',
+                                  color: 'var(--rose)',
+                                  cursor: 'pointer',
+                                  padding: '2px 6px',
+                                  fontSize: '11px',
+                                  borderRadius: '4px',
+                                  flexShrink: 0
+                                }}
+                                title="Remove from this mock exam"
+                              >
+                                ✕ Remove
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </form>
             </div>
@@ -4496,6 +5032,387 @@ export default function AdminDashboardPage({ navigateTo }) {
                 style={{ padding: '6px 14px', fontSize: '13px' }}
               >
                 Close Preview
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ==========================================
+          MODAL: ADD / AUTHOR NEW QUESTION
+          ========================================== */}
+      {showAddQuestionModal && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          background: 'rgba(0, 0, 0, 0.75)',
+          backdropFilter: 'blur(8px)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1100,
+          padding: '20px'
+        }}>
+          <div style={{
+            background: 'var(--bg-card)',
+            border: '1px solid var(--border-subtle)',
+            borderRadius: 'var(--radius-lg)',
+            width: '100%',
+            maxWidth: '720px',
+            maxHeight: '92vh',
+            display: 'flex',
+            flexDirection: 'column',
+            overflow: 'hidden',
+            boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.7)'
+          }}>
+            {/* Header */}
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '18px 24px',
+              borderBottom: '1px solid var(--border-subtle)',
+              background: 'rgba(255, 255, 255, 0.02)'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div style={{
+                  width: '36px',
+                  height: '36px',
+                  borderRadius: '8px',
+                  background: 'rgba(6, 182, 212, 0.15)',
+                  color: 'var(--cyan)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}>
+                  <Plus size={20} />
+                </div>
+                <div>
+                  <h3 style={{ margin: 0, fontSize: '17px', fontWeight: 700, color: '#fff' }}>
+                    ✍️ Prepare & Author Question
+                  </h3>
+                  <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                    Add questions to the verified database question bank & current mock exam
+                  </div>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                className="btn-icon"
+                onClick={() => setShowAddQuestionModal(false)}
+                disabled={questionSaving}
+                style={{ width: '32px', height: '32px' }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Form */}
+            <div style={{ padding: '24px', overflowY: 'auto', flex: 1 }}>
+              <form id="addQuestionForm" onSubmit={handleSaveNewQuestion} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                {questionFormError && (
+                  <div style={{
+                    padding: '10px 14px',
+                    borderRadius: 'var(--radius-sm)',
+                    background: 'rgba(244, 63, 94, 0.12)',
+                    border: '1px solid rgba(244, 63, 94, 0.3)',
+                    color: 'var(--rose)',
+                    fontSize: '13px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px'
+                  }}>
+                    <AlertCircle size={16} />
+                    <span>{questionFormError}</span>
+                  </div>
+                )}
+
+                {/* Subject & Topic */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '14px' }}>
+                  <div>
+                    <label style={{ display: 'block', fontSize: '12.5px', color: 'var(--text-secondary)', marginBottom: '6px' }}>
+                      Subject / Section *
+                    </label>
+                    <select
+                      value={questionForm.subject}
+                      onChange={e => setQuestionForm({ ...questionForm, subject: e.target.value })}
+                      style={{
+                        width: '100%',
+                        padding: '9px 12px',
+                        borderRadius: 'var(--radius-sm)',
+                        border: '1px solid var(--border-subtle)',
+                        background: 'var(--bg-dark)',
+                        color: '#fff',
+                        fontSize: '13.5px'
+                      }}
+                      required
+                    >
+                      <option value="Quantitative Aptitude">Quantitative Aptitude / Math</option>
+                      <option value="Reasoning Ability">Reasoning Ability & Logic</option>
+                      <option value="English Language">English Language & Comprehension</option>
+                      <option value="General Awareness">General Awareness / GK</option>
+                      <option value="General Science">General Science</option>
+                      <option value="Computer Knowledge">Computer Knowledge</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label style={{ display: 'block', fontSize: '12.5px', color: 'var(--text-secondary)', marginBottom: '6px' }}>
+                      Topic / Concept
+                    </label>
+                    <input
+                      type="text"
+                      value={questionForm.topic}
+                      onChange={e => setQuestionForm({ ...questionForm, topic: e.target.value })}
+                      placeholder="e.g. Percentages, Syllogisms, Cloze Test, Constitution"
+                      style={{
+                        width: '100%',
+                        padding: '9px 12px',
+                        borderRadius: 'var(--radius-sm)',
+                        border: '1px solid var(--border-subtle)',
+                        background: 'var(--bg-dark)',
+                        color: '#fff',
+                        fontSize: '13.5px'
+                      }}
+                    />
+                  </div>
+                </div>
+
+                {/* Question Type & Marks */}
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 120px', gap: '14px' }}>
+                  <div>
+                    <label style={{ display: 'block', fontSize: '12.5px', color: 'var(--text-secondary)', marginBottom: '6px' }}>
+                      Question Format
+                    </label>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <button
+                        type="button"
+                        className={`btn ${questionForm.question_type === 'MCQ' ? 'btn-primary' : 'btn-secondary'}`}
+                        onClick={() => setQuestionForm({ ...questionForm, question_type: 'MCQ' })}
+                        style={{ padding: '6px 14px', fontSize: '12.5px' }}
+                      >
+                        Multiple Choice (4 Options)
+                      </button>
+                      <button
+                        type="button"
+                        className={`btn ${questionForm.question_type === 'FILL_IN_THE_BLANK' ? 'btn-primary' : 'btn-secondary'}`}
+                        onClick={() => setQuestionForm({ ...questionForm, question_type: 'FILL_IN_THE_BLANK' })}
+                        style={{ padding: '6px 14px', fontSize: '12.5px' }}
+                      >
+                        Direct / Fill in the blank
+                      </button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label style={{ display: 'block', fontSize: '12.5px', color: 'var(--text-secondary)', marginBottom: '6px' }}>
+                      Marks / Points
+                    </label>
+                    <input
+                      type="number"
+                      min="1"
+                      max="10"
+                      value={questionForm.points}
+                      onChange={e => setQuestionForm({ ...questionForm, points: parseInt(e.target.value, 10) || 2 })}
+                      style={{
+                        width: '100%',
+                        padding: '9px 12px',
+                        borderRadius: 'var(--radius-sm)',
+                        border: '1px solid var(--border-subtle)',
+                        background: 'var(--bg-dark)',
+                        color: '#fff',
+                        fontSize: '13.5px'
+                      }}
+                    />
+                  </div>
+                </div>
+
+                {/* Question Prompt */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '12.5px', color: 'var(--text-secondary)', marginBottom: '6px' }}>
+                    Question Statement / Prompt *
+                  </label>
+                  <textarea
+                    rows={3}
+                    value={questionForm.question}
+                    onChange={e => setQuestionForm({ ...questionForm, question: e.target.value })}
+                    placeholder="Enter the full question text here (e.g. Which constitutional amendment introduced GST in India?)..."
+                    style={{
+                      width: '100%',
+                      padding: '10px 12px',
+                      borderRadius: 'var(--radius-sm)',
+                      border: '1px solid var(--border-subtle)',
+                      background: 'var(--bg-dark)',
+                      color: '#fff',
+                      fontSize: '13.5px',
+                      lineHeight: 1.5
+                    }}
+                    required
+                  />
+                </div>
+
+                {/* MCQ Options A, B, C, D */}
+                {questionForm.question_type === 'MCQ' ? (
+                  <div>
+                    <label style={{ display: 'block', fontSize: '12.5px', color: 'var(--text-secondary)', marginBottom: '8px' }}>
+                      Options (Select the correct option via radio button):
+                    </label>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                      {[
+                        { key: 'option_a', label: 'A', value: questionForm.option_a },
+                        { key: 'option_b', label: 'B', value: questionForm.option_b },
+                        { key: 'option_c', label: 'C', value: questionForm.option_c },
+                        { key: 'option_d', label: 'D', value: questionForm.option_d }
+                      ].map(opt => (
+                        <div
+                          key={opt.key}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '10px',
+                            background: questionForm.correct_answer === opt.label ? 'rgba(16, 185, 129, 0.08)' : 'rgba(255, 255, 255, 0.02)',
+                            padding: '8px 12px',
+                            borderRadius: '6px',
+                            border: `1px solid ${questionForm.correct_answer === opt.label ? 'rgba(16, 185, 129, 0.4)' : 'var(--border-subtle)'}`
+                          }}
+                        >
+                          <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', margin: 0, fontWeight: 700, fontSize: '13px', color: questionForm.correct_answer === opt.label ? 'var(--emerald)' : 'var(--text-secondary)' }}>
+                            <input
+                              type="radio"
+                              name="mcqCorrectAnswer"
+                              value={opt.label}
+                              checked={questionForm.correct_answer === opt.label}
+                              onChange={() => setQuestionForm({ ...questionForm, correct_answer: opt.label })}
+                              style={{ cursor: 'pointer' }}
+                            />
+                            <span>Option {opt.label}:</span>
+                          </label>
+                          <input
+                            type="text"
+                            value={opt.value}
+                            onChange={e => setQuestionForm({ ...questionForm, [opt.key]: e.target.value })}
+                            placeholder={`Enter text for Option ${opt.label}...`}
+                            style={{
+                              flex: 1,
+                              padding: '6px 10px',
+                              background: 'var(--bg-dark)',
+                              border: '1px solid var(--border-subtle)',
+                              borderRadius: '4px',
+                              color: '#fff',
+                              fontSize: '13px'
+                            }}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    <label style={{ display: 'block', fontSize: '12.5px', color: 'var(--emerald)', fontWeight: 600, marginBottom: '6px' }}>
+                      Exact Correct Answer *
+                    </label>
+                    <input
+                      type="text"
+                      value={questionForm.correct_answer}
+                      onChange={e => setQuestionForm({ ...questionForm, correct_answer: e.target.value })}
+                      placeholder="Enter the exact answer string or number..."
+                      style={{
+                        width: '100%',
+                        padding: '9px 12px',
+                        borderRadius: 'var(--radius-sm)',
+                        border: '1px solid var(--border-emerald-glow)',
+                        background: 'var(--bg-dark)',
+                        color: '#fff',
+                        fontSize: '13.5px'
+                      }}
+                      required
+                    />
+                  </div>
+                )}
+
+                {/* Explanation */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '12.5px', color: 'var(--text-secondary)', marginBottom: '6px' }}>
+                    Explanation / Solution Notes (Shown during student result review)
+                  </label>
+                  <textarea
+                    rows={2}
+                    value={questionForm.explanation}
+                    onChange={e => setQuestionForm({ ...questionForm, explanation: e.target.value })}
+                    placeholder="Explain the step-by-step formula or rule behind the correct answer..."
+                    style={{
+                      width: '100%',
+                      padding: '8px 12px',
+                      borderRadius: 'var(--radius-sm)',
+                      border: '1px solid var(--border-subtle)',
+                      background: 'var(--bg-dark)',
+                      color: '#fff',
+                      fontSize: '13px'
+                    }}
+                  />
+                </div>
+
+                {/* Checkbox: Attach to current mock */}
+                {(showCreateMockModal || !!editingMockExam) && (
+                  <div style={{
+                    padding: '10px 14px',
+                    borderRadius: '6px',
+                    background: 'rgba(99, 102, 241, 0.08)',
+                    border: '1px solid rgba(99, 102, 241, 0.2)'
+                  }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', margin: 0, fontSize: '13px', color: '#fff' }}>
+                      <input
+                        type="checkbox"
+                        checked={questionForm.attach_to_current_mock}
+                        onChange={e => setQuestionForm({ ...questionForm, attach_to_current_mock: e.target.checked })}
+                        style={{ cursor: 'pointer' }}
+                      />
+                      <span>
+                        <strong>Include immediately in this Mock Exam</strong> (Adds directly into the 50-question set)
+                      </span>
+                    </label>
+                  </div>
+                )}
+              </form>
+            </div>
+
+            {/* Modal Footer */}
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'flex-end',
+              gap: '10px',
+              padding: '16px 24px',
+              borderTop: '1px solid var(--border-subtle)',
+              background: 'rgba(255, 255, 255, 0.02)'
+            }}>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => setShowAddQuestionModal(false)}
+                disabled={questionSaving}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                form="addQuestionForm"
+                className="btn btn-primary"
+                disabled={questionSaving}
+                style={{ gap: '6px' }}
+              >
+                {questionSaving ? (
+                  <span>Saving Question...</span>
+                ) : (
+                  <>
+                    <Check size={16} />
+                    <span>Save & Add Question</span>
+                  </>
+                )}
               </button>
             </div>
           </div>

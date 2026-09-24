@@ -709,6 +709,174 @@ app.post('/api/admin/mock-exams', requireAdmin, (req, res) => {
   });
 });
 
+// 6B. Admin: Helper to Auto-Assemble and return a verified 50-Question Set for Mock Exam Preparation
+app.post('/api/admin/mock-exams/generate-set', requireAdmin, (req, res) => {
+  const { subject_distribution, preset } = req.body;
+  const allQ = dbService.find('quiz_questions');
+
+  let counts = subject_distribution || { english: 15, math: 15, reasoning: 10, general_awareness: 10 };
+
+  if (preset === 'ssc') {
+    counts = { english: 15, math: 15, reasoning: 10, general_awareness: 10 };
+  } else if (preset === 'railway') {
+    counts = { english: 10, math: 15, reasoning: 15, general_awareness: 10 };
+  } else if (preset === 'banking') {
+    counts = { english: 20, math: 15, reasoning: 15, general_awareness: 0 };
+  } else if (preset === 'balanced') {
+    counts = { english: 12, math: 13, reasoning: 13, general_awareness: 12 };
+  }
+
+  const englishQs = allQ.filter(q => (q.subject || '').includes('English'));
+  const mathQs = allQ.filter(q => (q.subject || '').includes('Math'));
+  const reasonQs = allQ.filter(q => (q.subject || '').includes('Reason'));
+  const gaQs = allQ.filter(q => (q.subject || '').includes('Awareness'));
+  const sciQs = allQ.filter(q => (q.subject || '').includes('Science'));
+
+  const sampled = [
+    ...englishQs.sort(() => Math.random() - 0.5).slice(0, counts.english || 15).map(q => q.id),
+    ...mathQs.sort(() => Math.random() - 0.5).slice(0, counts.math || 15).map(q => q.id),
+    ...reasonQs.sort(() => Math.random() - 0.5).slice(0, counts.reasoning || 10).map(q => q.id),
+    ...gaQs.sort(() => Math.random() - 0.5).slice(0, counts.general_awareness || 10).map(q => q.id)
+  ];
+
+  let finalQuestionIds = Array.from(new Set(sampled));
+  // Guarantee minimum 50 questions
+  if (finalQuestionIds.length < 50) {
+    const remaining = allQ.filter(q => !finalQuestionIds.includes(q.id));
+    for (const r of remaining) {
+      finalQuestionIds.push(r.id);
+      if (finalQuestionIds.length >= 50) break;
+    }
+  }
+
+  // Hydrate preview questions
+  const hydrated = finalQuestionIds.map(qid => dbService.findById('quiz_questions', qid)).filter(Boolean);
+
+  res.json({
+    success: true,
+    total: finalQuestionIds.length,
+    question_ids: finalQuestionIds,
+    questions: hydrated
+  });
+});
+
+// 6C. Admin: Add New Question directly to Question Bank (and optionally attach to a Mock Exam)
+app.post('/api/admin/mock-exams/questions', requireAdmin, (req, res) => {
+  const {
+    question,
+    question_type,
+    options,
+    correct_answer,
+    explanation,
+    subject,
+    topic,
+    points,
+    mock_exam_id
+  } = req.body;
+
+  if (!question || !question.trim()) {
+    return res.status(400).json({ error: 'Question text is required' });
+  }
+
+  if (!correct_answer || !String(correct_answer).trim()) {
+    return res.status(400).json({ error: 'Correct answer is required' });
+  }
+
+  let finalOptions = Array.isArray(options) ? options.filter(o => o && String(o).trim()) : [];
+  const isBlank = question_type === 'FILL_IN_THE_BLANK' || finalOptions.length === 0;
+
+  const newQuestion = dbService.insert('quiz_questions', {
+    topic_id: null,
+    question: question.trim(),
+    question_type: isBlank ? 'FILL_IN_THE_BLANK' : (question_type || 'MCQ'),
+    options_json: isBlank ? [] : finalOptions,
+    correct_answer: String(correct_answer).trim(),
+    explanation: (explanation || '').trim(),
+    subject: subject || 'General',
+    topic: topic || 'Custom Practice',
+    points: parseInt(points, 10) || 2,
+    created_by: 'Administrator',
+    created_at: new Date().toISOString()
+  });
+
+  // If a mock_exam_id was specified, immediately append this question to that mock exam!
+  let updatedExam = null;
+  if (mock_exam_id) {
+    const exam = dbService.findById('mock_exams', parseInt(mock_exam_id, 10));
+    if (exam) {
+      const qIds = Array.isArray(exam.question_ids) ? [...exam.question_ids] : [];
+      if (!qIds.includes(newQuestion.id)) {
+        qIds.push(newQuestion.id);
+        updatedExam = dbService.update('mock_exams', exam.id, {
+          question_ids: qIds,
+          total_questions: qIds.length,
+          total_marks: qIds.length * 2,
+          updated_at: new Date().toISOString()
+        });
+      }
+    }
+  }
+
+  res.status(201).json({
+    success: true,
+    data: newQuestion,
+    mock_exam: updatedExam,
+    message: 'Question created successfully and added to Question Bank.'
+  });
+});
+
+// 6D. Admin: Update Existing Question in Question Bank
+app.put('/api/admin/mock-exams/questions/:id', requireAdmin, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const existing = dbService.findById('quiz_questions', id);
+  if (!existing) {
+    return res.status(404).json({ error: 'Question not found' });
+  }
+
+  const {
+    question,
+    question_type,
+    options,
+    correct_answer,
+    explanation,
+    subject,
+    topic,
+    points
+  } = req.body;
+
+  const updates = { updated_at: new Date().toISOString() };
+  if (question !== undefined) updates.question = question.trim();
+  if (question_type !== undefined) updates.question_type = question_type;
+  if (options !== undefined && Array.isArray(options)) updates.options_json = options;
+  if (correct_answer !== undefined) updates.correct_answer = String(correct_answer).trim();
+  if (explanation !== undefined) updates.explanation = (explanation || '').trim();
+  if (subject !== undefined) updates.subject = subject.trim();
+  if (topic !== undefined) updates.topic = topic.trim();
+  if (points !== undefined) updates.points = parseInt(points, 10) || 2;
+
+  const updated = dbService.update('quiz_questions', id, updates);
+  res.json({
+    success: true,
+    data: updated,
+    message: 'Question updated successfully.'
+  });
+});
+
+// 6E. Admin: Delete Question from Question Bank
+app.delete('/api/admin/mock-exams/questions/:id', requireAdmin, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const existing = dbService.findById('quiz_questions', id);
+  if (!existing) {
+    return res.status(404).json({ error: 'Question not found' });
+  }
+
+  dbService.delete('quiz_questions', id);
+  res.json({
+    success: true,
+    message: `Question #${id} removed successfully.`
+  });
+});
+
 // 7. Admin: Update Mock Exam
 app.put('/api/admin/mock-exams/:id', requireAdmin, (req, res) => {
   const id = parseInt(req.params.id, 10);
@@ -727,6 +895,8 @@ app.put('/api/admin/mock-exams/:id', requireAdmin, (req, res) => {
     negative_marking,
     instructions,
     question_ids,
+    auto_generate,
+    subject_distribution,
     status
   } = req.body;
 
@@ -744,15 +914,43 @@ app.put('/api/admin/mock-exams/:id', requireAdmin, (req, res) => {
   if (instructions !== undefined) updates.instructions = instructions;
   if (status !== undefined) updates.status = status;
 
-  if (question_ids !== undefined) {
-    if (!Array.isArray(question_ids) || question_ids.length < 50) {
+  let finalQuestionIds = Array.isArray(question_ids) ? [...question_ids] : undefined;
+
+  // Support re-generating in edit mode if requested
+  if (auto_generate) {
+    const allQ = dbService.find('quiz_questions');
+    const englishQs = allQ.filter(q => (q.subject || '').includes('English'));
+    const mathQs = allQ.filter(q => (q.subject || '').includes('Math'));
+    const reasonQs = allQ.filter(q => (q.subject || '').includes('Reason'));
+    const gaQs = allQ.filter(q => (q.subject || '').includes('Awareness'));
+
+    const counts = subject_distribution || { english: 15, math: 15, reasoning: 10, general_awareness: 10 };
+    const sampled = [
+      ...englishQs.sort(() => Math.random() - 0.5).slice(0, counts.english || 15).map(q => q.id),
+      ...mathQs.sort(() => Math.random() - 0.5).slice(0, counts.math || 15).map(q => q.id),
+      ...reasonQs.sort(() => Math.random() - 0.5).slice(0, counts.reasoning || 10).map(q => q.id),
+      ...gaQs.sort(() => Math.random() - 0.5).slice(0, counts.general_awareness || 10).map(q => q.id)
+    ];
+
+    finalQuestionIds = Array.from(new Set(sampled));
+    if (finalQuestionIds.length < 50) {
+      const remaining = allQ.filter(q => !finalQuestionIds.includes(q.id));
+      for (const r of remaining) {
+        finalQuestionIds.push(r.id);
+        if (finalQuestionIds.length >= 50) break;
+      }
+    }
+  }
+
+  if (finalQuestionIds !== undefined) {
+    if (finalQuestionIds.length < 50) {
       return res.status(400).json({
-        error: `Mock exams must contain a minimum of 50 questions. (Attempted to save ${Array.isArray(question_ids) ? question_ids.length : 0})`
+        error: `Mock exams must contain a minimum of 50 questions. (Attempted to save ${finalQuestionIds.length} questions)`
       });
     }
-    updates.question_ids = question_ids;
-    updates.total_questions = question_ids.length;
-    updates.total_marks = question_ids.length * 2;
+    updates.question_ids = finalQuestionIds;
+    updates.total_questions = finalQuestionIds.length;
+    updates.total_marks = finalQuestionIds.length * 2;
   }
 
   const updated = dbService.update('mock_exams', id, updates);
